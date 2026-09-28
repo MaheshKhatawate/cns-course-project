@@ -1,0 +1,57 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                String       @id @default(cuid())
+  username          String       @unique
+  displayName       String
+  // bcrypt hash of the one-time recovery code shown once at registration.
+  // Plain-text recovery codes are never stored.
+  recoveryCodeHash  String?
+  recoveryCreatedAt DateTime?
+  recoveryLastUsedAt DateTime?
+  createdAt         DateTime     @default(now())
+  credentials       Credential[]
+  activities        ActivityLog[]
+
+  @@index([username])
+}
+
+model Credential {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // base64url-encoded credential ID (from SimpleWebAuthn)
+  credentialID String    @unique
+  // base64-encoded credential public key bytes (from SimpleWebAuthn)
+  publicKey    String
+  counter      BigInt    @default(0)
+  transports   String[]  @default([])
+  deviceLabel  String    @default("My device")
+  createdAt    DateTime  @default(now())
+  lastUsedAt   DateTime?
+  // null = active; non-null = revoked (kept for audit/history)
+  revokedAt    DateTime?
+
+  @@index([userId])
+  @@index([credentialID])
+}
+
+model ActivityLog {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type        String
+  message     String
+  deviceLabel String?
+  ip          String?
+  createdAt   DateTime @default(now())
+
+  @@index([userId, createdAt])
+}

@@ -1,0 +1,25 @@
+{
+  "name": "passwordless-webauthn-monorepo",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Passwordless Authentication Using Public-Key Cryptography (FIDO2/WebAuthn) — academic CNS project",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,green \"npm run dev --workspace=apps/server\" \"npm run dev --workspace=apps/web\"",
+    "dev:server": "npm run dev --workspace=apps/server",
+    "dev:web": "npm run dev --workspace=apps/web",
+    "build": "npm run build --workspace=packages/shared && npm run build --workspace=apps/server && npm run build --workspace=apps/web",
+    "test": "npm run test --workspace=apps/server",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:generate": "prisma generate",
+    "prisma:studio": "prisma studio"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "prisma": "^5.18.0",
+    "typescript": "^5.5.4"
+  }
+}
