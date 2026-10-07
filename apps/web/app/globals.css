@@ -2,30 +2,60 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  @apply bg-slate-50 text-slate-900;
+@layer base {
+  body {
+    @apply min-h-screen bg-slate-50 text-slate-900 antialiased;
+    background-image:
+      radial-gradient(60rem 30rem at 10% -10%, rgba(99, 102, 241, 0.12), transparent 60%),
+      radial-gradient(50rem 25rem at 100% 0%, rgba(168, 85, 247, 0.1), transparent 60%);
+    background-attachment: fixed;
+  }
+  code {
+    @apply font-mono text-[0.85em];
+  }
+  ::selection {
+    @apply bg-indigo-200 text-indigo-950;
+  }
 }
 
-.card {
-  @apply rounded-xl border border-slate-200 bg-white p-6 shadow-sm;
-}
-
-.btn-primary {
-  @apply rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50;
-}
-
-.btn-secondary {
-  @apply rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50;
-}
-
-.btn-danger {
-  @apply rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-50;
-}
-
-.input {
-  @apply w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-900 focus:ring-1 focus:ring-slate-900;
-}
-
-.label {
-  @apply mb-1 block text-sm font-medium text-slate-700;
+@layer components {
+  .card {
+    @apply rounded-2xl border border-slate-200/80 bg-white/80 p-6 shadow-[0_1px_2px_rgba(15,23,42,0.04),0_12px_32px_-16px_rgba(15,23,42,0.14)] backdrop-blur;
+  }
+  .card-hover {
+    @apply transition hover:-translate-y-0.5 hover:border-indigo-200 hover:shadow-[0_1px_2px_rgba(15,23,42,0.04),0_18px_40px_-18px_rgba(79,70,229,0.35)];
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-gradient-to-r from-indigo-600 to-violet-600 text-white shadow-md shadow-indigo-500/25 hover:from-indigo-500 hover:to-violet-500;
+  }
+  .btn-secondary {
+    @apply btn border border-slate-200 bg-white text-slate-800 shadow-sm hover:border-slate-300 hover:bg-slate-50;
+  }
+  .btn-danger {
+    @apply btn border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100;
+  }
+  .btn-ghost {
+    @apply btn text-slate-600 hover:bg-slate-100 hover:text-slate-900;
+  }
+  .btn-sm {
+    @apply px-3 py-1.5 text-xs;
+  }
+  .input {
+    @apply h-11 w-full rounded-xl border border-slate-200 bg-white px-3.5 text-sm shadow-sm outline-none transition placeholder:text-slate-400 focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100;
+  }
+  .label {
+    @apply mb-1.5 block text-sm font-medium text-slate-700;
+  }
+  .eyebrow {
+    @apply text-xs font-semibold uppercase tracking-wider text-indigo-600;
+  }
+  .gradient-text {
+    @apply bg-gradient-to-r from-indigo-600 via-violet-600 to-fuchsia-500 bg-clip-text text-transparent;
+  }
+  .icon-tile {
+    @apply flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600 ring-1 ring-inset ring-indigo-100;
+  }
 }

@@ -4,8 +4,9 @@
 // (replay protection). A multi-instance production deployment would need a
 // shared store instead.
 
-interface Entry {
+interface Entry<T = unknown> {
   challenge: string;
+  data?: T;
   expiresAt: number;
 }
 
@@ -18,18 +19,24 @@ function sweep() {
   }
 }
 
-export function saveChallenge(key: string, challenge: string, ttlMs: number) {
+// `data` carries ceremony state that must not be trusted from the client
+// (e.g. the pending username/user handle during registration).
+export function saveChallenge<T>(key: string, challenge: string, ttlMs: number, data?: T) {
   sweep();
-  store.set(key, { challenge, expiresAt: Date.now() + ttlMs });
+  store.set(key, { challenge, data, expiresAt: Date.now() + ttlMs });
 }
 
-export function consumeChallenge(key: string): string | null {
+export function consumeChallengeEntry<T>(key: string): { challenge: string; data?: T } | null {
   sweep();
-  const entry = store.get(key);
+  const entry = store.get(key) as Entry<T> | undefined;
   if (!entry) return null;
   store.delete(key);
   if (entry.expiresAt <= Date.now()) return null;
-  return entry.challenge;
+  return { challenge: entry.challenge, data: entry.data };
+}
+
+export function consumeChallenge(key: string): string | null {
+  return consumeChallengeEntry(key)?.challenge ?? null;
 }
 
 export function peekChallenge(key: string): string | null {

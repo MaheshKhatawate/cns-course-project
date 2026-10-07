@@ -2,12 +2,13 @@ import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 
 // Human-typable recovery code: 4 groups of 4 unambiguous chars, e.g. "7KQ2-M9XD-...".
+// 16 symbols from a 31-character alphabet ≈ 79 bits of entropy.
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 
 export function generateRecoveryCode(): string {
-  const bytes = crypto.randomBytes(16);
   let s = '';
-  for (let i = 0; i < 16; i++) s += ALPHABET[bytes[i] % ALPHABET.length];
+  // crypto.randomInt uses rejection sampling, so every symbol is uniformly likely.
+  for (let i = 0; i < 16; i++) s += ALPHABET[crypto.randomInt(ALPHABET.length)];
   return `${s.slice(0, 4)}-${s.slice(4, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}`;
 }
 

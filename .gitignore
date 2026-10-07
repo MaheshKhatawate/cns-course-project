@@ -8,3 +8,5 @@ out/
 coverage/
 apps/web/.next/
 apps/server/dist/
+.DS_Store
+*.tsbuildinfo

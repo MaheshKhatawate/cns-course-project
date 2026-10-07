@@ -1,39 +1,23 @@
 import { Router } from 'express';
-import jwt from 'jsonwebtoken';
+import { config } from '../config.js';
 import { prisma } from '../db.js';
-import { getToken, requireAuth, type AuthedRequest } from '../middleware/requireAuth.js';
-import { verifySession } from '../auth.js';
+import { logActivity } from '../activity.js';
+import { generateRecoveryCode, hashRecoveryCode } from '../recovery.js';
+import { requireAuth, requireFreshAuth, type AuthedRequest } from '../middleware/requireAuth.js';
 import { wrapRouter } from '../middleware/wrapRouter.js';
 
 export const usersRouter = Router();
 usersRouter.use(requireAuth);
 
 usersRouter.get('/me', async (req: AuthedRequest, res) => {
-  const user = await prisma.user.findUnique({ where: { id: req.userId! } });
-  if (!user) {
+  const [user, session, deviceCount] = await Promise.all([
+    prisma.user.findUnique({ where: { id: req.userId! } }),
+    prisma.session.findUnique({ where: { id: req.sessionId! }, include: { credential: true } }),
+    prisma.credential.count({ where: { userId: req.userId!, revokedAt: null } }),
+  ]);
+  if (!user || !session) {
     res.status(401).json({ error: 'Account not found.' });
     return;
-  }
-  const deviceCount = await prisma.credential.count({
-    where: { userId: user.id, revokedAt: null },
-  });
-  const token = getToken(req);
-  let session: { issuedAt: string | null; expiresAt: string | null } = {
-    issuedAt: null,
-    expiresAt: null,
-  };
-  if (token) {
-    try {
-      const decoded = jwt.decode(token) as { iat?: number; exp?: number } | null;
-      session = {
-        issuedAt: decoded?.iat ? new Date(decoded.iat * 1000).toISOString() : null,
-        expiresAt: decoded?.exp ? new Date(decoded.exp * 1000).toISOString() : null,
-      };
-      verifySession(token); // ensures it is still valid, not just decodable
-    } catch {
-      res.status(401).json({ error: 'Session expired or invalid. Please log in again.' });
-      return;
-    }
   }
   res.json({
     user: {
@@ -44,8 +28,31 @@ usersRouter.get('/me', async (req: AuthedRequest, res) => {
     },
     deviceCount,
     hasRecoveryCode: Boolean(user.recoveryCodeHash),
-    session: { ...session, status: 'authenticated' },
+    recovery: {
+      createdAt: user.recoveryCreatedAt?.toISOString() ?? null,
+      lastUsedAt: user.recoveryLastUsedAt?.toISOString() ?? null,
+    },
+    session: {
+      id: session.id,
+      status: 'authenticated',
+      issuedAt: session.createdAt.toISOString(),
+      expiresAt: session.expiresAt.toISOString(),
+      lastAuthAt: session.lastAuthAt.toISOString(),
+      freshUntil: new Date(session.lastAuthAt.getTime() + config.stepUpMaxAgeMs).toISOString(),
+      deviceLabel: session.credential?.deviceLabel ?? null,
+    },
   });
+});
+
+// Replace the recovery code (e.g. if the old one was exposed). Requires a fresh passkey check.
+usersRouter.post('/me/recovery-code', requireFreshAuth, async (req: AuthedRequest, res) => {
+  const recoveryCode = generateRecoveryCode();
+  await prisma.user.update({
+    where: { id: req.userId! },
+    data: { recoveryCodeHash: await hashRecoveryCode(recoveryCode), recoveryCreatedAt: new Date() },
+  });
+  await logActivity(req.userId!, 'RECOVERY_CODE_ROTATED', 'A new recovery code was generated; the old one no longer works.', { req });
+  res.json({ recoveryCode });
 });
 
 wrapRouter(usersRouter);

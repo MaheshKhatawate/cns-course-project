@@ -10,6 +10,10 @@ export type ActivityType =
   | 'DEVICE_ADDED'
   | 'DEVICE_REVOKED'
   | 'RECOVERY_USED'
+  | 'RECOVERY_CODE_ROTATED'
+  | 'STEP_UP'
+  | 'DEVICE_LINK_CODE'
+  | 'SESSION_REVOKED'
   | 'LOGOUT';
 
 export interface PublicUser {

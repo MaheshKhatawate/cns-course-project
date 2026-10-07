@@ -15,7 +15,12 @@
     "test": "npm run test --workspace=apps/server",
     "prisma:migrate": "prisma migrate dev",
     "prisma:generate": "prisma generate",
-    "prisma:studio": "prisma studio"
+    "prisma:studio": "prisma studio",
+    "test:integration": "npm run test:integration --workspace=apps/server",
+    "demo:attacks": "npm run demo:attacks --workspace=apps/server",
+    "bench": "npm run bench --workspace=apps/server",
+    "db:up": "docker compose up -d db",
+    "prisma:deploy": "prisma migrate deploy"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",

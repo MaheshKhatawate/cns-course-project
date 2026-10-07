@@ -8,19 +8,21 @@ datasource db {
 }
 
 model User {
-  id                String       @id @default(cuid())
-  username          String       @unique
-  displayName       String
+  id                 String        @id @default(cuid())
+  username           String        @unique
+  displayName        String
+  // Opaque random WebAuthn user handle (base64url). Shared by all of the user's
+  // passkeys and returned by authenticators during usernameless login.
+  webauthnUserId     String        @unique
   // bcrypt hash of the one-time recovery code shown once at registration.
   // Plain-text recovery codes are never stored.
-  recoveryCodeHash  String?
-  recoveryCreatedAt DateTime?
+  recoveryCodeHash   String?
+  recoveryCreatedAt  DateTime?
   recoveryLastUsedAt DateTime?
-  createdAt         DateTime     @default(now())
-  credentials       Credential[]
-  activities        ActivityLog[]
-
-  @@index([username])
+  createdAt          DateTime      @default(now())
+  credentials        Credential[]
+  activities         ActivityLog[]
+  sessions           Session[]
 }
 
 model Credential {
@@ -29,18 +31,45 @@ model Credential {
   user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   // base64url-encoded credential ID (from SimpleWebAuthn)
   credentialID String    @unique
-  // base64-encoded credential public key bytes (from SimpleWebAuthn)
+  // base64-encoded COSE public key bytes. The private key never leaves the authenticator.
   publicKey    String
+  // COSE algorithm identifier (-7 = ES256, -8 = EdDSA, -257 = RS256)
+  algorithm    Int?
   counter      BigInt    @default(0)
   transports   String[]  @default([])
+  // Authenticator model identifier (all zeros when attestation is "none")
+  aaguid       String?
+  // "singleDevice" (device-bound key) or "multiDevice" (synced passkey)
+  deviceType   String?
+  backedUp     Boolean   @default(false)
   deviceLabel  String    @default("My device")
   createdAt    DateTime  @default(now())
   lastUsedAt   DateTime?
   // null = active; non-null = revoked (kept for audit/history)
   revokedAt    DateTime?
+  sessions     Session[]
 
   @@index([userId])
-  @@index([credentialID])
+}
+
+// Server-side record of every issued JWT (the JWT "jti" is the Session id), so that
+// sessions can be listed, revoked on logout, and revoked when their device is revoked.
+model Session {
+  id           String      @id @default(cuid())
+  userId       String
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credentialId String?
+  credential   Credential? @relation(fields: [credentialId], references: [id], onDelete: SetNull)
+  createdAt    DateTime    @default(now())
+  expiresAt    DateTime
+  // Last time the user proved possession of a private key in this session
+  // (login or step-up re-authentication). Sensitive actions require this to be recent.
+  lastAuthAt   DateTime    @default(now())
+  revokedAt    DateTime?
+  ip           String?
+  userAgent    String?
+
+  @@index([userId])
 }
 
 model ActivityLog {

@@ -7,7 +7,7 @@ export const activityRouter = Router();
 activityRouter.use(requireAuth);
 
 activityRouter.get('/', async (req: AuthedRequest, res) => {
-  const limit = Math.min(Math.max(Number(req.query.limit ?? 10) || 10, 1), 50);
+  const limit = Math.min(Math.max(Number(req.query.limit ?? 10) || 10, 1), 100);
   const logs = await prisma.activityLog.findMany({
     where: { userId: req.userId! },
     orderBy: { createdAt: 'desc' },

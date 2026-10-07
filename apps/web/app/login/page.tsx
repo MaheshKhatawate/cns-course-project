@@ -4,67 +4,72 @@ import { useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { startAuthentication } from '@simplewebauthn/browser';
-import { api, webauthnStatus } from '@/lib/api';
-import { Alert } from '@/components/ui';
+import { errorMessage, post, webauthnStatus, type LoginVerification } from '@/lib/api';
+import { inspectAssertion, saveCeremony } from '@/lib/inspect';
+import { KeyRound, ScanFace } from 'lucide-react';
+import { Alert, AuthCard, Divider } from '@/components/ui';
 
 type AuthOptions = Parameters<typeof startAuthentication>[0]['optionsJSON'];
 
 export default function LoginPage() {
   const router = useRouter();
   const [username, setUsername] = useState('');
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<'username' | 'passkey' | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  async function onLogin(e: React.FormEvent) {
-    e.preventDefault();
+  async function signIn(withUsername: boolean) {
     setError(null);
     const w = webauthnStatus();
     if (!w.ok) {
       setError(w.reason ?? 'WebAuthn is not available.');
       return;
     }
-    setBusy(true);
+    setBusy(withUsername ? 'username' : 'passkey');
     try {
-      // 1–2. Identify account, get a fresh server challenge.
-      const options = await api<AuthOptions>('/api/auth/login-options', {
-        method: 'POST',
-        body: JSON.stringify({ username }),
-      });
-      // 3–4. Browser invokes the authenticator; user verifies; assertion is signed.
-      const assertion = await startAuthentication({ optionsJSON: options });
-      // 5. Server verifies the assertion and sets the JWT session cookie.
-      await api('/api/auth/login-verify', {
-        method: 'POST',
-        body: JSON.stringify({ username, assertionResponse: assertion }),
-      });
+      // 1. Server issues a fresh, single-use, time-limited challenge.
+      const { flowId, options } = await post<{ flowId: string; options: AuthOptions }>(
+        '/api/auth/login-options',
+        withUsername ? { username } : {},
+      );
+      // 2. The authenticator asks for user verification and signs the challenge.
+      const assertionResponse = await startAuthentication({ optionsJSON: options });
+      // 3. Server verifies the signature with the stored public key and starts a session.
+      const res = await post<{ verification: LoginVerification }>('/api/auth/login-verify', { flowId, assertionResponse });
+      saveCeremony(inspectAssertion(assertionResponse, res.verification as unknown as Record<string, unknown>));
       router.push('/dashboard');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Login failed.');
+      setError(errorMessage(err, 'Login failed.'));
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
 
   return (
-    <div className="card mx-auto max-w-lg space-y-4">
-      <h1 className="text-xl font-bold">Log in with your passkey</h1>
-      <p className="text-sm text-slate-600">
-        No password. The server sends a one-time challenge; your authenticator signs it.
-      </p>
+    <AuthCard icon={KeyRound} title="Welcome back" subtitle="No password. The server sends a one-time challenge and your device signs it.">
       {error && <Alert kind="error">{error}</Alert>}
-      <form onSubmit={onLogin} className="space-y-3">
+      <button type="button" className="btn-primary w-full py-3" onClick={() => signIn(false)} disabled={busy !== null}>
+        <ScanFace className="h-4 w-4" /> {busy === 'passkey' ? 'Waiting for your authenticator…' : 'Sign in with a passkey'}
+      </button>
+      <Divider label="or use your username" />
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          signIn(true);
+        }}
+        className="space-y-3"
+      >
         <div>
           <label className="label" htmlFor="username">Username</label>
-          <input id="username" className="input" value={username} onChange={(e) => setUsername(e.target.value)} required autoComplete="username" />
+          <input id="username" className="input" value={username} onChange={(e) => setUsername(e.target.value)} required autoComplete="username webauthn" placeholder="your username" />
         </div>
-        <button className="btn-primary w-full" disabled={busy}>
-          {busy ? 'Waiting for your authenticator…' : 'Log in with WebAuthn'}
+        <button className="btn-secondary w-full py-3" disabled={busy !== null}>
+          {busy === 'username' ? 'Waiting for your authenticator…' : 'Continue with username'}
         </button>
       </form>
       <div className="flex justify-between text-sm">
-        <Link href="/register" className="underline">New here? Register</Link>
-        <Link href="/recovery" className="underline">Lost your device?</Link>
+        <Link href="/register" className="font-medium text-indigo-600 hover:underline">Create an account</Link>
+        <Link href="/recovery" className="text-slate-500 hover:text-slate-800 hover:underline">Lost your device?</Link>
       </div>
-    </div>
+    </AuthCard>
   );
 }

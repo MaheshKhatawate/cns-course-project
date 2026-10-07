@@ -1,46 +1,51 @@
+import crypto from 'node:crypto';
 import { Router } from 'express';
-import {
-  generateAuthenticationOptions,
-  generateRegistrationOptions,
-  verifyAuthenticationResponse,
-  verifyRegistrationResponse,
-} from '@simplewebauthn/server';
 import { z } from 'zod';
 import { config } from '../config.js';
 import { prisma } from '../db.js';
-import { consumeChallenge, saveChallenge } from '../challengeStore.js';
-import { signSession } from '../auth.js';
+import { consumeChallenge, consumeChallengeEntry, saveChallenge } from '../challengeStore.js';
+import { verifySession } from '../auth.js';
 import { logActivity } from '../activity.js';
 import { generateRecoveryCode, hashRecoveryCode } from '../recovery.js';
+import { authenticationOptions, newWebAuthnUserId, registrationOptions, verifyAssertion, verifyRegistration } from '../webauthn.js';
+import { clearSessionCookie, issueSession } from '../sessions.js';
+import { getToken, requireAuth, type AuthedRequest } from '../middleware/requireAuth.js';
 import { wrapRouter } from '../middleware/wrapRouter.js';
 
 export const authRouter = Router();
 
-const usernameSchema = z
+export const usernameSchema = z
   .string()
   .trim()
-  .min(3)
-  .max(64)
+  .min(3, 'Use 3–64 letters, numbers, dots, underscores or dashes.')
+  .max(64, 'Use 3–64 letters, numbers, dots, underscores or dashes.')
   .regex(/^[a-zA-Z0-9._-]+$/, 'Use 3–64 letters, numbers, dots, underscores or dashes.');
 
-const optionsSchema = z.object({
-  username: usernameSchema,
-  displayName: z.string().trim().min(1).max(64).optional(),
-  deviceLabel: z.string().trim().min(1).max(64).optional(),
-});
+export const deviceLabelSchema = z.string().trim().min(1).max(64);
 
-function norm(name: string) {
+export function norm(name: string) {
   return name.trim().toLowerCase();
 }
 
-function toPublicUser(u: { id: string; username: string; displayName: string; createdAt: Date }) {
+export function toPublicUser(u: { id: string; username: string; displayName: string; createdAt: Date }) {
   return { id: u.id, username: u.username, displayName: u.displayName, createdAt: u.createdAt.toISOString() };
 }
 
-// ---- Registration ----
+interface PendingRegistration {
+  username: string;
+  displayName: string;
+  webauthnUserId: string;
+}
+
+// ---- Registration (FR-1) ----
+// The account is only created after the authenticator has proven possession of
+// a new key pair, so abandoned registrations leave nothing behind and nobody can
+// attach a passkey to someone else's existing username.
 
 authRouter.post('/register-options', async (req, res) => {
-  const parsed = optionsSchema.safeParse(req.body);
+  const parsed = z
+    .object({ username: usernameSchema, displayName: z.string().trim().max(64).optional() })
+    .safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid request.' });
     return;
@@ -48,258 +53,214 @@ authRouter.post('/register-options', async (req, res) => {
   const username = norm(parsed.data.username);
   const displayName = parsed.data.displayName?.trim() || parsed.data.username.trim();
 
-  let user = await prisma.user.findUnique({ where: { username } });
-  if (!user) {
-    user = await prisma.user.create({ data: { username, displayName } });
+  const existing = await prisma.user.findUnique({ where: { username } });
+  if (existing) {
+    res.status(409).json({
+      error: 'That username is already taken. Log in instead, or add a new device from your dashboard.',
+    });
+    return;
   }
 
-  const activeCreds = await prisma.credential.findMany({
-    where: { userId: user.id, revokedAt: null },
-  });
-
-  const options = await generateRegistrationOptions({
-    rpName: config.rpName,
-    rpID: config.rpID,
-    userName: user.username,
-    timeout: 60000,
-    attestationType: 'none',
-    excludeCredentials: activeCreds.map((c) => ({
-      id: c.credentialID,
-      transports: (c.transports as ('usb' | 'nfc' | 'ble' | 'internal' | 'hybrid' | 'cable')[]) ?? undefined,
-    })),
-    authenticatorSelection: { residentKey: 'preferred', userVerification: 'preferred' },
-    supportedAlgorithmIDs: [-7, -257],
-  });
-
-  saveChallenge(`reg:${user.id}`, options.challenge, config.challengeTtlMs);
+  const pending: PendingRegistration = { username, displayName, webauthnUserId: newWebAuthnUserId() };
+  const options = await registrationOptions(pending);
+  saveChallenge(`reg:${username}`, options.challenge, config.challengeTtlMs, pending);
   res.json(options);
 });
 
 authRouter.post('/register-verify', async (req, res) => {
   const parsed = z
-    .object({
-      username: usernameSchema,
-      attResp: z.record(z.unknown()),
-      deviceLabel: z.string().trim().min(1).max(64).optional(),
-    })
+    .object({ username: usernameSchema, attResp: z.record(z.unknown()), deviceLabel: deviceLabelSchema.optional() })
     .safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid registration response.' });
     return;
   }
   const username = norm(parsed.data.username);
-  const user = await prisma.user.findUnique({ where: { username } });
-  if (!user) {
-    res.status(404).json({ error: 'Account not found. Please start registration again.' });
+  const entry = consumeChallengeEntry<PendingRegistration>(`reg:${username}`);
+  if (!entry?.data) {
+    res.status(400).json({ error: 'Registration expired. Please start again.' });
     return;
   }
+  const pending = entry.data;
 
-  const expectedChallenge = consumeChallenge(`reg:${user.id}`);
-  if (!expectedChallenge) {
-    await logActivity(user.id, 'LOGIN_FAILED', 'Registration failed: expired challenge.', { req });
-    res.status(400).json({ error: 'Challenge expired. Please start registration again.' });
-    return;
-  }
-
-  let verification;
-  try {
-    verification = await verifyRegistrationResponse({
-      response: parsed.data.attResp as never,
-      expectedChallenge,
-      expectedOrigin: config.origin,
-      expectedRPID: config.rpID,
-    });
-  } catch {
-    await logActivity(user.id, 'LOGIN_FAILED', 'Registration failed: invalid response.', { req });
+  const cred = await verifyRegistration(parsed.data.attResp, entry.challenge);
+  if (!cred) {
     res.status(400).json({ error: 'Registration verification failed. Please try again.' });
     return;
   }
-
-  if (!verification.verified || !verification.registrationInfo) {
-    await logActivity(user.id, 'LOGIN_FAILED', 'Registration failed: not verified.', { req });
-    res.status(400).json({ error: 'Registration verification failed. Please try again.' });
+  if (await prisma.user.findUnique({ where: { username } })) {
+    res.status(409).json({ error: 'That username was just taken. Please choose another.' });
     return;
   }
-
-  const { credential } = verification.registrationInfo;
-  const credentialID = credential.id;
-  const publicKeyB64 = Buffer.from(credential.publicKey).toString('base64');
-
-  const existing = await prisma.credential.findUnique({ where: { credentialID } });
-  if (existing) {
+  if (await prisma.credential.findUnique({ where: { credentialID: cred.credentialID } })) {
     res.status(409).json({ error: 'This authenticator is already registered.' });
     return;
   }
 
-  const isFirstCredential =
-    (await prisma.credential.count({ where: { userId: user.id, revokedAt: null } })) === 0;
+  const deviceLabel = parsed.data.deviceLabel || 'My device';
+  const recoveryCode = generateRecoveryCode();
+  const recoveryCodeHash = await hashRecoveryCode(recoveryCode);
 
-  await prisma.credential.create({
-    data: {
-      userId: user.id,
-      credentialID,
-      publicKey: publicKeyB64,
-      counter: BigInt(credential.counter ?? 0),
-      transports: [],
-      deviceLabel: parsed.data.deviceLabel?.trim() || 'My device',
-    },
+  const { user, credential } = await prisma.$transaction(async (tx) => {
+    const user = await tx.user.create({
+      data: { ...pending, recoveryCodeHash, recoveryCreatedAt: new Date() },
+    });
+    const credential = await tx.credential.create({ data: { ...cred, userId: user.id, deviceLabel } });
+    return { user, credential };
   });
 
-  // First credential for the account: create the one-time recovery code.
-  let recoveryCode: string | undefined;
-  if (isFirstCredential) {
-    recoveryCode = generateRecoveryCode();
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { recoveryCodeHash: await hashRecoveryCode(recoveryCode), recoveryCreatedAt: new Date() },
-    });
-  }
+  await logActivity(user.id, 'REGISTRATION', 'Account registered with first passkey.', { deviceLabel, req });
+  await issueSession(req, res, user, credential.id);
+  await logActivity(user.id, 'LOGIN_SUCCESS', 'Signed in after registration.', { deviceLabel, req });
 
-  await logActivity(
-    user.id,
-    'REGISTRATION',
-    isFirstCredential ? 'Account registered with first passkey.' : 'New passkey registered.',
-    { deviceLabel: parsed.data.deviceLabel, req },
-  );
-
-  res.json({ verified: true, user: toPublicUser(user), ...(recoveryCode ? { recoveryCode } : {}) });
+  res.json({
+    verified: true,
+    user: toPublicUser(user),
+    recoveryCode,
+    credential: { id: credential.id, deviceLabel, algorithm: credential.algorithm, deviceType: credential.deviceType },
+  });
 });
 
-// ---- Login ----
+// ---- Login: challenge–response (FR-2) ----
+// With a username the challenge is bound to that account's passkeys; without one
+// the browser offers any discoverable passkey for this site (usernameless login).
 
 authRouter.post('/login-options', async (req, res) => {
-  const parsed = z.object({ username: usernameSchema }).safeParse(req.body);
+  const parsed = z.object({ username: usernameSchema.optional() }).safeParse(req.body ?? {});
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid username.' });
     return;
   }
-  const username = norm(parsed.data.username);
-  const user = await prisma.user.findUnique({ where: { username } });
-  if (!user) {
-    res.status(404).json({ error: 'Account not found. Please register first.' });
-    return;
-  }
-  const creds = await prisma.credential.findMany({ where: { userId: user.id, revokedAt: null } });
-  if (creds.length === 0) {
-    res.status(400).json({ error: 'No active passkeys. Use recovery to register a new one.' });
-    return;
+  let userId: string | undefined;
+  let allowed: Awaited<ReturnType<typeof prisma.credential.findMany>> = [];
+  if (parsed.data.username) {
+    const user = await prisma.user.findUnique({ where: { username: norm(parsed.data.username) } });
+    if (!user) {
+      res.status(404).json({ error: 'Account not found. Please register first.' });
+      return;
+    }
+    allowed = await prisma.credential.findMany({ where: { userId: user.id, revokedAt: null } });
+    if (allowed.length === 0) {
+      res.status(400).json({ error: 'No active passkeys. Use recovery to register a new one.' });
+      return;
+    }
+    userId = user.id;
   }
 
-  const options = await generateAuthenticationOptions({
-    rpID: config.rpID,
-    timeout: 60000,
-    userVerification: 'preferred',
-    allowCredentials: creds.map((c) => ({
-      id: c.credentialID,
-      transports: (c.transports as ('usb' | 'nfc' | 'ble' | 'internal' | 'hybrid' | 'cable')[]) ?? undefined,
-    })),
-  });
-
-  saveChallenge(`auth:${user.id}`, options.challenge, config.challengeTtlMs);
-  res.json(options);
+  const options = await authenticationOptions(allowed);
+  const flowId = crypto.randomUUID();
+  saveChallenge(`auth:${flowId}`, options.challenge, config.challengeTtlMs, { userId });
+  res.json({ flowId, options });
 });
 
 authRouter.post('/login-verify', async (req, res) => {
   const parsed = z
-    .object({ username: usernameSchema, assertionResponse: z.record(z.unknown()) })
+    .object({ flowId: z.string().uuid(), assertionResponse: z.record(z.unknown()) })
     .safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid login response.' });
     return;
   }
-  const username = norm(parsed.data.username);
-  const user = await prisma.user.findUnique({ where: { username } });
-  if (!user) {
-    res.status(404).json({ error: 'Account not found.' });
+  // Single use: the challenge is deleted here, so a captured response cannot be replayed.
+  const entry = consumeChallengeEntry<{ userId?: string }>(`auth:${parsed.data.flowId}`);
+  if (!entry) {
+    res.status(400).json({ error: 'Challenge expired or already used. Please try logging in again.' });
     return;
   }
 
-  const expectedChallenge = consumeChallenge(`auth:${user.id}`);
-  if (!expectedChallenge) {
-    await logActivity(user.id, 'LOGIN_FAILED', 'Login failed: expired challenge.', { req });
-    res.status(400).json({ error: 'Challenge expired. Please try logging in again.' });
+  const result = await verifyAssertion(parsed.data.assertionResponse, entry.challenge, {
+    expectedUserId: entry.data?.userId,
+    req,
+  });
+  if (!result.ok) {
+    res.status(result.status).json({ error: result.error });
     return;
   }
-
-  const body = parsed.data.assertionResponse as { id?: string };
-  if (typeof body.id !== 'string') {
-    res.status(400).json({ error: 'Invalid login response.' });
-    return;
-  }
-  const credential = await prisma.credential.findUnique({ where: { credentialID: body.id } });
-  if (!credential || credential.userId !== user.id || credential.revokedAt) {
-    await logActivity(user.id, 'LOGIN_FAILED', 'Login failed: unknown or revoked credential.', { req });
-    res.status(401).json({ error: 'This passkey is not valid for this account (it may have been revoked).' });
-    return;
-  }
-
-  let verification;
-  try {
-    verification = await verifyAuthenticationResponse({
-      response: parsed.data.assertionResponse as never,
-      expectedChallenge,
-      expectedOrigin: config.origin,
-      expectedRPID: config.rpID,
-      credential: {
-        id: credential.credentialID,
-        publicKey: new Uint8Array(Buffer.from(credential.publicKey, 'base64')),
-        counter: Number(credential.counter),
-        transports: (credential.transports as never) ?? undefined,
-      },
-    });
-  } catch {
-    await logActivity(user.id, 'LOGIN_FAILED', 'Login failed: invalid assertion.', {
-      deviceLabel: credential.deviceLabel,
-      req,
-    });
-    res.status(401).json({ error: 'Login verification failed. Please try again.' });
-    return;
-  }
-
-  if (!verification.verified || !verification.authenticationInfo) {
-    await logActivity(user.id, 'LOGIN_FAILED', 'Login failed: assertion not verified.', {
-      deviceLabel: credential.deviceLabel,
-      req,
-    });
-    res.status(401).json({ error: 'Login verification failed. Please try again.' });
-    return;
-  }
-
-  // Replay/clone protection: the authenticator counter must move forward.
-  const newCounter = BigInt(verification.authenticationInfo.newCounter);
-  if (credential.counter > BigInt(0) && newCounter <= credential.counter) {
-    await logActivity(user.id, 'LOGIN_FAILED', 'Login rejected: credential counter did not increase.', {
-      deviceLabel: credential.deviceLabel,
-      req,
-    });
-    res.status(401).json({ error: 'Login rejected: possible cloned authenticator.' });
-    return;
-  }
+  const { user, credential, info } = result;
 
   await prisma.credential.update({
     where: { id: credential.id },
-    data: { counter: newCounter, lastUsedAt: new Date() },
+    data: { counter: BigInt(info.newCounter), lastUsedAt: new Date(), backedUp: info.backedUp },
   });
+  const { session } = await issueSession(req, res, user, credential.id);
+  await logActivity(user.id, 'LOGIN_SUCCESS', 'Successful passkey login.', { deviceLabel: credential.deviceLabel, req });
 
-  const token = signSession(user.id, user.username);
-  res.cookie('session', token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: config.isProd,
-    maxAge: 60 * 60 * 1000, // matches default 1h JWT expiry
-    path: '/',
+  res.json({
+    verified: true,
+    user: toPublicUser(user),
+    session: { expiresAt: session.expiresAt.toISOString() },
+    verification: {
+      credentialId: credential.credentialID,
+      deviceLabel: credential.deviceLabel,
+      algorithm: credential.algorithm,
+      previousCounter: Number(credential.counter),
+      newCounter: info.newCounter,
+      userVerified: info.userVerified,
+      deviceType: info.deviceType,
+      backedUp: info.backedUp,
+      origin: info.origin,
+      rpID: info.rpID,
+    },
   });
+});
 
-  await logActivity(user.id, 'LOGIN_SUCCESS', 'Successful login.', {
-    deviceLabel: credential.deviceLabel,
+// ---- Step-up re-authentication (FR-6) ----
+
+authRouter.post('/reauth-options', requireAuth, async (req: AuthedRequest, res) => {
+  const creds = await prisma.credential.findMany({ where: { userId: req.userId!, revokedAt: null } });
+  if (creds.length === 0) {
+    res.status(400).json({ error: 'No active passkeys on this account.' });
+    return;
+  }
+  const options = await authenticationOptions(creds);
+  saveChallenge(`reauth:${req.sessionId}`, options.challenge, config.challengeTtlMs);
+  res.json(options);
+});
+
+authRouter.post('/reauth-verify', requireAuth, async (req: AuthedRequest, res) => {
+  const parsed = z.object({ assertionResponse: z.record(z.unknown()) }).safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid response.' });
+    return;
+  }
+  const challenge = consumeChallenge(`reauth:${req.sessionId}`);
+  if (!challenge) {
+    res.status(400).json({ error: 'Challenge expired. Please try again.' });
+    return;
+  }
+  const result = await verifyAssertion(parsed.data.assertionResponse, challenge, { expectedUserId: req.userId, req });
+  if (!result.ok) {
+    res.status(result.status).json({ error: result.error });
+    return;
+  }
+  const now = new Date();
+  await prisma.credential.update({
+    where: { id: result.credential.id },
+    data: { counter: BigInt(result.info.newCounter), lastUsedAt: now },
+  });
+  await prisma.session.update({ where: { id: req.sessionId! }, data: { lastAuthAt: now } });
+  await logActivity(req.userId!, 'STEP_UP', 'Identity re-confirmed with passkey (step-up).', {
+    deviceLabel: result.credential.deviceLabel,
     req,
   });
-
-  res.json({ verified: true, user: toPublicUser(user) });
+  res.json({ verified: true, freshUntil: new Date(now.getTime() + config.stepUpMaxAgeMs).toISOString() });
 });
 
 authRouter.post('/logout', async (req, res) => {
-  res.clearCookie('session', { path: '/' });
+  const token = getToken(req);
+  if (token) {
+    try {
+      const claims = verifySession(token);
+      const session = await prisma.session.findUnique({ where: { id: claims.jti } });
+      if (session && !session.revokedAt) {
+        await prisma.session.update({ where: { id: session.id }, data: { revokedAt: new Date() } });
+        await logActivity(claims.sub, 'LOGOUT', 'Signed out.', { req });
+      }
+    } catch {
+      // Expired/invalid token: nothing to revoke, just clear the cookie.
+    }
+  }
+  clearSessionCookie(res);
   res.json({ ok: true });
 });
 

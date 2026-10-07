@@ -7,6 +7,7 @@ import {
   verifyRecoveryCode,
 } from './recovery.js';
 import { signRecoveryToken, signSession, verifyRecoveryToken, verifySession } from './auth.js';
+import { parseDurationMs } from './config.js';
 
 describe('challenge store', () => {
   beforeEach(() => clearChallenges());
@@ -46,25 +47,64 @@ describe('recovery codes', () => {
 
 describe('JWT sessions', () => {
   it('signs and verifies a session, and rejects tampered tokens', () => {
-    const token = signSession('user-1', 'alice');
+    const token = signSession('user-1', 'alice', 'session-1');
     const claims = verifySession(token);
     expect(claims.sub).toBe('user-1');
     expect(claims.username).toBe('alice');
+    expect(claims.jti).toBe('session-1');
     expect(() => verifySession(token + 'tampered')).toThrow();
   });
 
   it('rejects expired tokens', async () => {
     const { default: jwt } = await import('jsonwebtoken');
     const { config } = await import('./config.js');
-    const expired = jwt.sign({ sub: 'u', username: 'x' }, config.jwtSecret, { expiresIn: '1ms' });
+    const expired = jwt.sign({ sub: 'u', username: 'x', purpose: 'session' }, config.jwtSecret, { expiresIn: '1ms', jwtid: 's' });
     await new Promise((r) => setTimeout(r, 20));
     expect(() => verifySession(expired)).toThrow();
   });
 
   it('recovery tokens cannot be used as session tokens and vice versa', () => {
-    const rec = signRecoveryToken('user-1', 'alice');
+    const rec = signRecoveryToken('user-1', 'alice', 'bcrypt-hash');
     expect(verifyRecoveryToken(rec).purpose).toBe('recovery');
-    const session = signSession('user-1', 'alice');
+    expect(() => verifySession(rec)).toThrow();
+    const session = signSession('user-1', 'alice', 's1');
     expect(() => verifyRecoveryToken(session)).toThrow();
+  });
+
+  it('rejects tokens signed with the "none" algorithm', async () => {
+    const { default: jwt } = await import('jsonwebtoken');
+    const unsigned = jwt.sign({ sub: 'u', username: 'x', purpose: 'session', jti: 's' }, '', { algorithm: 'none' });
+    expect(() => verifySession(unsigned)).toThrow();
+  });
+});
+
+describe('config', () => {
+  it('parses session durations', () => {
+    expect(parseDurationMs('15m')).toBe(900_000);
+    expect(parseDurationMs('1h')).toBe(3_600_000);
+    expect(parseDurationMs('7d')).toBe(604_800_000);
+    expect(parseDurationMs('30')).toBe(30_000);
+    expect(() => parseDurationMs('soon')).toThrow();
+  });
+});
+
+describe('device link codes', () => {
+  it('are single-use and case/format-insensitive', async () => {
+    const { createLinkCode, checkLinkCode, consumeLinkCode, clearLinkCodes } = await import('./linkCodes.js');
+    clearLinkCodes();
+    const { code } = createLinkCode('u1');
+    expect(code).toMatch(/^[A-Z0-9]{4}-[A-Z0-9]{4}$/);
+    const id = checkLinkCode('u1', code.toLowerCase().replace('-', ' '));
+    expect(id).toBeTruthy();
+    expect(consumeLinkCode('u1', id!)).toBe(true);
+    expect(checkLinkCode('u1', code)).toBeNull();
+  });
+
+  it('are invalidated after 5 wrong guesses', async () => {
+    const { createLinkCode, checkLinkCode, clearLinkCodes } = await import('./linkCodes.js');
+    clearLinkCodes();
+    const { code } = createLinkCode('u2');
+    for (let i = 0; i < 5; i++) expect(checkLinkCode('u2', 'WRON-GGGG')).toBeNull();
+    expect(checkLinkCode('u2', code)).toBeNull();
   });
 });
